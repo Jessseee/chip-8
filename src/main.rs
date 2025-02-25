@@ -1,11 +1,10 @@
+mod screen;
+mod keypad;
+
 #[macro_use]
 extern crate paris;
 
-#[cfg(target_os = "windows")]
-use std::str::FromStr;
-
 use clap::Parser;
-use minifb::{Icon, Key, KeyRepeat, Menu, MenuItem, Scale, ScaleMode, Window, WindowOptions};
 use rand::random;
 use rfd::FileDialog;
 use rodio::source::SineWave;
@@ -15,10 +14,15 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use strum::FromRepr;
+use sdl3::event::Event;
+use sdl3::EventPump;
+use sdl3::keyboard::Keycode;
+use sdl3::render::WindowCanvas;
+use crate::keypad::Keypad;
+use crate::screen::Screen;
 
-const SCREEN_WIDTH: usize = 64;
-const SCREEN_HEIGHT: usize = 32;
+const SCREEN_WIDTH: u32 = 64;
+const SCREEN_HEIGHT: u32 = 32;
 const MEMORY_SIZE: usize = 4096;
 const NUM_VAR_REGS: usize = 16;
 const PROGRAM_ADDR: usize = 0x200;
@@ -43,42 +47,22 @@ const FONT: [u8; FONT_SIZE] = [
     0xF0, 0x80, 0xF0, 0x80, 0x80, // F
 ];
 
-#[derive(FromRepr, Debug, PartialEq)]
-#[repr(usize)]
-enum MenuItemId {
-    OpenFile = 1,
-}
-
-fn open_window(width: usize, height: usize) -> Window {
-    // Initialize window with menu
-    let mut window = Window::new(
-        "CHIP-8",
-        width,
-        height,
-        WindowOptions {
-            resize: false,
-            scale: Scale::X16,
-            scale_mode: ScaleMode::Stretch,
-            ..WindowOptions::default()
-        },
-    )
-    .expect("Failed to create window");
-
-    #[cfg(target_os = "windows")]
-    window.set_icon(Icon::from_str("logo.ico").expect("Failed to set window icon"));
-
-    let mut menu = Menu::new("file").expect("Failed to create window menu.");
-    let menu_item = MenuItem::new("open", MenuItemId::OpenFile as usize);
-    menu.add_menu_item(&menu_item);
-    window.add_menu(&menu);
-
-    window
-}
-
 fn get_rom() -> Option<PathBuf> {
     FileDialog::new()
         .add_filter("chip-8 rom", &["ch8"])
         .pick_file()
+}
+
+fn open_window(scale: f32) -> (WindowCanvas, EventPump) {
+    let sdl_context = sdl3::init().unwrap();
+    let video_subsystem = sdl_context.video().unwrap();
+    let window = video_subsystem.window("CHIP-8", SCREEN_WIDTH * scale as u32, SCREEN_HEIGHT * scale as u32)
+        .position_centered()
+        .build()
+        .unwrap();
+    let event_pump = sdl_context.event_pump().unwrap();
+    let canvas = window.into_canvas();
+    (canvas, event_pump)
 }
 
 struct Instruction {
@@ -117,8 +101,9 @@ impl Instruction {
 
 struct Interpreter {
     program: Option<Vec<u8>>,
-    window: Window,
-    screen_buffer: Vec<u32>,
+    events: EventPump,
+    keypad: Keypad,
+    screen: Screen,
     memory: [u8; MEMORY_SIZE],
     pc: usize,
     index: usize,
@@ -130,12 +115,19 @@ struct Interpreter {
     wait_input: bool,
 }
 
-impl Default for Interpreter {
-    fn default() -> Self {
-        Self {
+impl Interpreter {
+    fn insert_data(&mut self, addr: usize, data: &[u8]) -> &mut Interpreter {
+        self.memory[addr..addr + data.len()].copy_from_slice(&data);
+        self
+    }
+
+    fn new(args: &Args) -> Self {
+        let (canvas, event_pump) = open_window(args.scale);
+        let mut interpreter = Self {
             program: None,
-            window: open_window(SCREEN_WIDTH, SCREEN_HEIGHT),
-            screen_buffer: vec![0; SCREEN_WIDTH * SCREEN_HEIGHT],
+            events: event_pump,
+            keypad: Keypad::new(),
+            screen: Screen::new(canvas, args.scale),
             memory: [0; MEMORY_SIZE],
             pc: PROGRAM_ADDR,
             index: 0,
@@ -145,18 +137,7 @@ impl Default for Interpreter {
             vars: [0u8; NUM_VAR_REGS],
             paused: false,
             wait_input: false,
-        }
-    }
-}
-
-impl Interpreter {
-    fn insert_data(&mut self, addr: usize, data: &[u8]) -> &mut Interpreter {
-        self.memory[addr..addr + data.len()].copy_from_slice(&data);
-        self
-    }
-
-    fn new() -> Self {
-        let mut interpreter = Self::default();
+        };
         interpreter.insert_data(FONT_ADDR, &FONT);
         interpreter
     }
@@ -179,38 +160,11 @@ impl Interpreter {
         int
     }
 
-    fn key_enum_to_keycode(&self, key: Key) -> Option<u8> {
-        match key {
-            Key::Key1 => Some(0x1),
-            Key::Key2 => Some(0x2),
-            Key::Key3 => Some(0x3),
-            Key::Key4 => Some(0xC),
-            Key::Q => Some(0x4),
-            Key::W => Some(0x5),
-            Key::E => Some(0x6),
-            Key::R => Some(0xD),
-            Key::A => Some(0x7),
-            Key::S => Some(0x8),
-            Key::D => Some(0x9),
-            Key::F => Some(0xE),
-            Key::Z => Some(0xA),
-            Key::X => Some(0x0),
-            Key::C => Some(0xB),
-            Key::V => Some(0xF),
-            _ => None
-        }
-    }
-
     fn execute_instruction(&mut self, int: Instruction) {
         let (vx, vy) = (self.vars[int.x], self.vars[int.y]);
         let from = self.pc; // Hold on to the position of the current instruction to detect loops
         self.pc += 2; // Increment program counter to next instruction
-
-        // Get pressed keys
-        let keys: Vec<u8> = self.window.get_keys()
-            .iter()
-            .filter_map(|&key| self.key_enum_to_keycode(key))
-            .collect();
+        let keys = self.keypad.get_keys();
 
         match int.nibbles {
             /* 0NNN: Machine language routines */
@@ -221,8 +175,7 @@ impl Interpreter {
             /* 00E0: Clear screen */
             (0x0, 0x0, 0xE, 0x0) => {
                 info!("{}: {} -> Clear screen", from, int);
-                self.clear_screen();
-                return; // return to skip window.update()
+                self.screen.clear();
             }
             /* 00EE: Return from subroutine */
             (0x0, 0x0, 0xE, 0xE) => {
@@ -375,29 +328,19 @@ impl Interpreter {
             /* DXYN: Display */
             (0xD, _, _, _) => {
                 info!("{}: {} -> Display sprite at {}, {}", from, int, vx, vy);
-                let x = vx as u32 % SCREEN_WIDTH as u32;
-                let y = vy as u32 % SCREEN_HEIGHT as u32;
+                let x = vx as u32 % SCREEN_WIDTH;
+                let y = vy as u32 % SCREEN_HEIGHT;
                 self.vars[0xF] = 0;
                 let rows = &self.memory[self.index..self.index + int.n as usize];
                 for (dy, row) in (0..int.n as u32).zip(rows) {
-                    if y + dy >= (SCREEN_HEIGHT as u32) {
-                        break;
-                    }
+                    if y + dy >= (SCREEN_HEIGHT) { break; }
                     for dx in 0..8 {
-                        let i = ((x + dx) + (y + dy) * SCREEN_WIDTH as u32) as usize;
-                        if x + dx >= (SCREEN_WIDTH as u32) {
-                            break;
-                        }
-                        let pixel_on = (row >> (7 - dx)) & 1 == 1;
-                        if pixel_on {
-                            self.screen_buffer[i] =
-                                if self.screen_buffer[i] > 0 { 0x0 } else { 0xFFFFFFFF }
+                        if x + dx >= (SCREEN_WIDTH) { break; }
+                        if (row >> (7 - dx)) & 1 == 1 {
+                            self.screen.draw_point(x + dx, y + dy);
                         }
                     }
                 }
-                self.window
-                    .update_with_buffer(&self.screen_buffer, SCREEN_WIDTH, SCREEN_HEIGHT)
-                    .expect("Failed to update window.");
             }
 
             /* EXNN: Skip if key (non-blocking) */
@@ -446,16 +389,15 @@ impl Interpreter {
             }
             /* FX0A: Get key (blocking) */
             (0xF, _, 0x0, 0xA) => {
-                let keys = self.window.get_keys_released();
                 if keys.is_empty() {
                     if !self.wait_input {
                         info!("{}: {} -> Wait for key release", from, int);
                         self.wait_input = true;
                     }
                     self.pc -= 2;
-                } else if let Some(key) = self.key_enum_to_keycode(keys[0]) {
+                } else {
                     info!("{}: {} -> Key {:01X} released", from, int, int.x);
-                    self.vars[int.x] = key;
+                    self.vars[int.x] = keys[0];
                     self.wait_input = false;
                 }
             }
@@ -489,21 +431,16 @@ impl Interpreter {
             /* Unknown instruction */
             _ => panic!("Unknown instruction at {}: {}", self.pc, int),
         }
-
-        self.window.update();
     }
 
-    fn clear_screen(&mut self) {
-        self.screen_buffer = vec![0; SCREEN_WIDTH * SCREEN_HEIGHT];
-        self.window
-            .update_with_buffer(&self.screen_buffer, SCREEN_WIDTH, SCREEN_HEIGHT)
-            .expect("Failed to update window.");
-    }
-
-    fn run(mut self, run_flag: Arc<AtomicBool>, args: Args) {
+    fn run(mut self, run_flag: Arc<AtomicBool>, args: &Args) {
         // Initialize 60Hz delay timer
         let timer_interval = Duration::from_secs_f32(1. / 60.);
         let mut next_timer_tick = Instant::now() + timer_interval;
+
+        // Initialize 60Hz screen refresh timer
+        let screen_interval = Duration::from_secs_f32(1. / 60.);
+        let mut next_screen_tick = Instant::now() + screen_interval;
 
         // Initialize 500Hz clock timer
         let clock_interval = Duration::from_millis(1000/args.speed);
@@ -516,37 +453,43 @@ impl Interpreter {
             .take_duration(Duration::from_secs(1))
             .amplify(0.20);
 
+        let path = get_rom().unwrap_or(PathBuf::from("./roms/timendus/2-ibm-logo.ch8"));
+        let program =
+            std::fs::read(path).expect("Failed to read selected program.");
+        self.insert_data(PROGRAM_ADDR, &program);
+        self.program = Some(program);
+
         // Event loop
-        while run_flag.load(Ordering::Relaxed)
-            && self.window.is_open()
-            && !self.window.is_key_down(Key::Escape)
+        'running: while run_flag.load(Ordering::Relaxed)
         {
             // Handle window events
-            if let Some(menu_id) = self.window.is_menu_pressed() {
-                match MenuItemId::from_repr(menu_id) {
-                    Some(MenuItemId::OpenFile) => {
-                        if let Some(file_path) = get_rom() {
-                            let program =
-                                std::fs::read(file_path).expect("Failed to read selected program.");
-                            self = Interpreter::new();
-                            self.insert_data(PROGRAM_ADDR, &program);
-                            self.program = Some(program);
-                            self.clear_screen();
-                            continue;
-                        }
+            for event in self.events.poll_iter() {
+                match event {
+                    Event::Quit {..} |
+                    Event::KeyDown { keycode: Some(Keycode::Escape), .. } => {
+                        break 'running
+                    },
+                    Event::KeyDown { keycode: Some(Keycode::Space), .. } => {
+                        self.paused = !self.paused;
                     }
-                    _ => (),
+                    Event::KeyDown { keycode: Some(key), .. } => {
+                        self.keypad.handle_keydown(key);
+                    }
+                    Event::KeyUp { keycode: Some(key), .. } => {
+                        self.keypad.handle_keyup(key);
+                    }
+                    _ => ()
                 }
             }
 
-            // pause/unpause program if space is pressed
-            if self.window.is_key_pressed(Key::Space, KeyRepeat::Yes) {
-                self.paused = !self.paused;
+            // Redraw screen
+            if Instant::now() >= next_screen_tick {
+                next_screen_tick = Instant::now() + screen_interval;
+                self.screen.redraw();
             }
 
-            // Stop executing if no program is loaded or interpreter is paused, allow stepping with right arrow
-            if self.program == None || self.paused && !self.window.is_key_pressed(Key::Right, KeyRepeat::Yes) {
-                self.window.update();
+            // Stop executing if no program is loaded
+            if self.program == None || self.paused {
                 continue;
             }
 
@@ -582,6 +525,8 @@ struct Args {
     #[arg(short, long)]
     #[clap(default_value="500", help="Clock speed in Hz.")]
     speed: u64,
+    #[arg(long)]
+    scale: f32
 }
 
 fn main() {
@@ -595,5 +540,5 @@ fn main() {
         .expect("Could not set Ctrl-C handler");
 
     // Start interpreter
-    Interpreter::new().run(run_flag, args);
+    Interpreter::new(&args).run(run_flag, &args);
 }
