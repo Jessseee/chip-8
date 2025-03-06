@@ -2,37 +2,42 @@ use sdl3::pixels::Color;
 use sdl3::render::{Canvas, FPoint};
 use sdl3::video::Window;
 
-pub(crate) struct Screen {
-    canvas: Canvas<Window>,
+pub struct Screen {
+    pub(crate) canvas: Canvas<Window>,
     buffer: Vec<bool>,
-    width: u32,
-    height: u32,
-    redraw_requested: bool,
+    resolutions: Vec<(u32, u32)>,
+    pub width: u32,
+    pub height: u32,
+    pub redraw_requested: bool,
 }
 
-const ON: Color = Color::RGBA(0xFF, 0xFF, 0xFF, 0xFF);
-const OFF: Color = Color::RGBA(0x0, 0x0, 0x0, 0xFF);
+const ON: Color = Color::RGBA(0xFC, 0x6A, 0x21, 0xFF);
+const OFF: Color = Color::RGBA(0x08, 0x05, 0x04, 0xFF);
 
 impl Screen {
-    pub fn new(mut canvas: Canvas<Window>, scale: f32) -> Self {
+    pub fn new(window: Window, resolutions: Vec<(u32, u32)>, scale: f32) -> Self {
+        let mut canvas = window.into_canvas();
         canvas.set_scale(scale, scale)
             .expect("Failed to set canvas scale");
-        let (width, height) = canvas.window().size();
+        let (width, height) = resolutions[0];
         let buffer = vec![false; (width * height) as usize];
         let redraw_requested = false;
-        Self { canvas, buffer, width, height, redraw_requested }
+        Self { canvas, buffer, width, height, resolutions, redraw_requested }
     }
 
     pub fn redraw(&mut self) {
         if !self.redraw_requested { return }
         self.canvas.set_draw_color(OFF);
         self.canvas.clear();
+        let (max_width, max_height) = self.resolutions.last().unwrap();
+        let offset_x = (max_width - self.width) / 2;
+        let offset_y = (max_height - self.height) / 2;
         let points: Vec<FPoint> = self.buffer.iter()
             .enumerate()
             .filter_map(|(i, &pixel)| {
                 if !pixel { return None }
-                let x = i % self.width as usize;
-                let y = i / self.width as usize;
+                let x = i % self.width as usize + offset_x as usize;
+                let y = i / self.width as usize + offset_y as usize;
                 Some(FPoint::new(x as f32, y as f32))
             }).collect();
         self.canvas.set_draw_color(ON);

@@ -1,6 +1,7 @@
 mod screen;
 mod keypad;
 mod interpreter;
+mod platform;
 
 #[macro_use]
 extern crate paris;
@@ -8,26 +9,27 @@ extern crate paris;
 use clap::Parser;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-
+use crate::platform::{Platform, PlatformId};
 use crate::interpreter::Interpreter;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
-struct Args {
+pub struct Args {
     #[arg(short, long)]
     #[clap(help="To beep or not to beep?")]
-    quiet: bool,
+    pub quiet: bool,
     #[arg(short, long)]
-    #[clap(default_value="500", help="Clock speed in Hz.")]
-    speed: u64,
-    #[arg(long)]
-    #[clap(default_value="12")]
-    scale: f32
+    #[clap(default_value="12", help="Screen pixel scale.")]
+    pub scale: f32,
+    #[arg(long, short)]
+    #[clap(default_value="original-chip8", help="CHIP-8 implementation.")]
+    pub platform: PlatformId,
 }
 
 fn main() {
     // Parse command line arguments
     let args = Args::parse();
+    let platform = Platform::from_id(&args.platform).unwrap();
 
     // Create flag to handle Ctrl-C gracefully
     let run_flag: Arc<AtomicBool> = Arc::new(AtomicBool::new(true));
@@ -36,5 +38,5 @@ fn main() {
         .expect("Could not set Ctrl-C handler");
 
     // Start interpreter
-    Interpreter::new(&args).run(run_flag, &args);
+    Interpreter::new(&args, platform).run(run_flag);
 }
