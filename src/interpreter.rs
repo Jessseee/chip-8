@@ -1,13 +1,13 @@
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use rand::random;
-use rfd::FileDialog;
 use rodio::{OutputStream, Sink, Source};
 use rodio::source::SineWave;
+use sdl3::dialog::{show_open_file_dialog, DialogCallback, DialogFileFilter};
 use sdl3::event::Event;
 use sdl3::EventPump;
 use sdl3::keyboard::Keycode;
@@ -98,7 +98,8 @@ impl Interrupt {
 
 pub struct Interpreter {
     quirks: HashMap<Quirk, bool>,
-    program: Option<Vec<u8>>,
+    program: Arc<Mutex<Option<Vec<u8>>>>,
+    program_changed: Arc<AtomicBool>,
     events: EventPump,
     keypad: Keypad,
     screen: Screen,
@@ -125,7 +126,8 @@ impl Interpreter {
         let (window, event_pump) = Self::open_window(width, height, args.scale, window_title);
         let mut interpreter = Self {
             quirks: platform.quirks,
-            program: None,
+            program: Arc::new(Mutex::new(None)),
+            program_changed: Arc::new(AtomicBool::new(false)),
             events: event_pump,
             keypad: Keypad::new(),
             screen: Screen::new(window, resolutions, args.scale),
@@ -147,6 +149,19 @@ impl Interpreter {
         interpreter
     }
 
+    fn reset(&mut self) {
+        self.memory = [0; MEMORY_SIZE];
+        self.insert_data(FONT_ADDR, &FONT);
+        self.pc = PROGRAM_ADDR;
+        self.vars = [0u8; NUM_VAR_REGS];
+        self.stack = Vec::new();
+        self.delay_timer = 0;
+        self.sound_timer = 0;
+        self.paused = false;
+        self.wait_input = false;
+        self.screen.clear();
+    }
+
     fn open_window(width: &u32, height: &u32, scale: f32, window_title: String) -> (Window, EventPump) {
         let sdl_context = sdl3::init().unwrap();
         let video_subsystem = sdl_context.video().unwrap();
@@ -158,10 +173,28 @@ impl Interpreter {
         (window, event_pump)
     }
 
-    fn get_rom(&self) -> Option<PathBuf> {
-        FileDialog::new()
-            .add_filter("chip-8 rom", &["ch8"])
-            .pick_file()
+    fn get_rom(&self) {
+        let program_clone = Arc::clone(&self.program);
+        let program_changed = Arc::clone(&self.program_changed);
+        let callback: DialogCallback = Box::new(move |result, _filters| {
+            *program_clone.lock().unwrap() = Some(
+                match result.unwrap().first() {
+                    Some(path) => std::fs::read(path).expect("Failed to read selected program."),
+                    _ => include_bytes!("../roms/ibm-logo.ch8").to_vec(),
+                }
+            );
+            program_changed.store(true, Ordering::Relaxed);
+        });
+        let filters = [
+            DialogFileFilter { name: "CHIP-8 ROM", pattern: "*" }
+        ];
+        show_open_file_dialog(
+            &filters,
+            None::<PathBuf>,
+            false,
+            self.screen.canvas.window(),
+            callback
+        ).expect("Failed to show open file dialog")
     }
 
     fn insert_data(&mut self, addr: usize, data: &[u8]) -> &mut Interpreter {
@@ -513,19 +546,13 @@ impl Interpreter {
             .amplify(0.20);
 
         // Load program
-        let program = match self.get_rom() {
-            Some(path) => std::fs::read(path).expect("Failed to read selected program."),
-            None => Vec::from(include_bytes!("../roms/ibm-logo.ch8"))
-        };
-        self.insert_data(PROGRAM_ADDR, &program);
-        self.program = Some(program);
-
+        self.get_rom();
 
         // Event loop
         'running: while run_flag.load(Ordering::Relaxed)
         {
             // Handle window events
-            for event in self.events.poll_iter() {
+            if let Some(event) = self.events.poll_event() {
                 match event {
                     Event::Quit {..} |
                     Event::KeyDown { keycode: Some(Keycode::Escape), .. } => {
@@ -533,6 +560,9 @@ impl Interpreter {
                     },
                     Event::KeyDown { keycode: Some(Keycode::Space), .. } => {
                         self.paused = !self.paused;
+                    }
+                    Event::KeyDown { keycode: Some(Keycode::O), .. } => {
+                        self.get_rom();
                     }
                     Event::KeyDown { keycode: Some(key), .. } => {
                         self.keypad.handle_keydown(key);
@@ -573,8 +603,16 @@ impl Interpreter {
                 continue;
             }
 
+            // Insert new program and reset interpreter if program was changed
+            if  self.program_changed.load(Ordering::Relaxed) {
+                let program = self.program.lock().unwrap().clone().unwrap();
+                self.reset();
+                self.insert_data(PROGRAM_ADDR, &program);
+                self.program_changed.store(false, Ordering::Relaxed);
+            }
+
             // Stop executing if no program is loaded or paused
-            if self.program == None || self.paused {
+            if self.program.lock().unwrap().is_none() || self.memory[PROGRAM_ADDR + 1] == 0 || self.paused {
                 continue;
             }
 
