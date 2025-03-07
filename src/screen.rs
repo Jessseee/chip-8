@@ -49,7 +49,6 @@ impl Screen {
     pub fn draw_point(&mut self, x: u32, y: u32) {
         let i = (x + y * self.width) as usize;
         self.buffer[i] = !self.buffer[i];
-        self.redraw_requested = true;
     }
 
     pub fn clear(&mut self) {

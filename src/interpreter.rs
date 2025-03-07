@@ -5,17 +5,16 @@ use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use rand::random;
-use rodio::{OutputStream, Sink, Source};
-use rodio::source::SineWave;
 use sdl3::dialog::{show_open_file_dialog, DialogCallback, DialogFileFilter};
 use sdl3::event::Event;
-use sdl3::EventPump;
+use sdl3::{AudioSubsystem, EventPump};
 use sdl3::keyboard::Keycode;
 use sdl3::video::Window;
 use crate::Args;
 use crate::platform::{Platform, Quirk};
 use crate::keypad::Keypad;
 use crate::screen::Screen;
+use crate::audio::Audio;
 
 const MEMORY_SIZE: usize = 4096;
 const NUM_VAR_REGS: usize = 16;
@@ -96,6 +95,13 @@ impl Interrupt {
     }
 }
 
+#[derive(PartialEq)]
+enum Debug {
+    ShouldStep,
+    HasStepped,
+    CanStep
+}
+
 pub struct Interpreter {
     quirks: HashMap<Quirk, bool>,
     program: Arc<Mutex<Option<Vec<u8>>>>,
@@ -103,13 +109,14 @@ pub struct Interpreter {
     events: EventPump,
     keypad: Keypad,
     screen: Screen,
+    audio: Audio,
     memory: [u8; MEMORY_SIZE],
+    vars: [u8; NUM_VAR_REGS],
+    stack: Vec<usize>,
     pc: usize,
     index: usize,
-    stack: Vec<usize>,
     delay_timer: u8,
     sound_timer: u8,
-    vars: [u8; NUM_VAR_REGS],
     paused: bool,
     wait_input: bool,
     quiet: bool,
@@ -123,7 +130,7 @@ impl Interpreter {
         let resolutions = platform.resolutions();
         let (width, height) = resolutions.last().unwrap();
         let window_title = format!("CHIP-8 | {:?}", platform.id);
-        let (window, event_pump) = Self::open_window(width, height, args.scale, window_title);
+        let (window, event_pump, audio) = Self::open_window(width, height, args.scale, window_title);
         let mut interpreter = Self {
             quirks: platform.quirks,
             program: Arc::new(Mutex::new(None)),
@@ -131,13 +138,14 @@ impl Interpreter {
             events: event_pump,
             keypad: Keypad::new(),
             screen: Screen::new(window, resolutions, args.scale),
+            audio: Audio::new(audio),
             memory: [0; MEMORY_SIZE],
+            vars: [0u8; NUM_VAR_REGS],
+            stack: Vec::new(),
             pc: PROGRAM_ADDR,
             index: 0,
-            stack: Vec::new(),
             delay_timer: 0,
             sound_timer: 0,
-            vars: [0u8; NUM_VAR_REGS],
             paused: false,
             wait_input: false,
             quiet: args.quiet,
@@ -162,7 +170,7 @@ impl Interpreter {
         self.screen.clear();
     }
 
-    fn open_window(width: &u32, height: &u32, scale: f32, window_title: String) -> (Window, EventPump) {
+    fn open_window(width: &u32, height: &u32, scale: f32, window_title: String) -> (Window, EventPump, AudioSubsystem) {
         let sdl_context = sdl3::init().unwrap();
         let video_subsystem = sdl_context.video().unwrap();
         let window = video_subsystem.window(&window_title, width * scale as u32, height * scale as u32)
@@ -170,23 +178,26 @@ impl Interpreter {
             .build()
             .unwrap();
         let event_pump = sdl_context.event_pump().unwrap();
-        (window, event_pump)
+        let audio = sdl_context.audio().unwrap();
+        (window, event_pump, audio)
     }
 
     fn get_rom(&self) {
         let program_clone = Arc::clone(&self.program);
         let program_changed = Arc::clone(&self.program_changed);
         let callback: DialogCallback = Box::new(move |result, _filters| {
+            let paths = result.ok();
             *program_clone.lock().unwrap() = Some(
-                match result.unwrap().first() {
-                    Some(path) => std::fs::read(path).expect("Failed to read selected program."),
+                match paths {
+                    Some(paths) => std::fs::read(paths.first().unwrap())
+                        .expect("Failed to read selected program."),
                     _ => include_bytes!("../roms/ibm-logo.ch8").to_vec(),
                 }
             );
             program_changed.store(true, Ordering::Relaxed);
         });
         let filters = [
-            DialogFileFilter { name: "CHIP-8 ROM", pattern: "*" }
+            DialogFileFilter { name: "CHIP-8 ROM", pattern: "ch8" }
         ];
         show_open_file_dialog(
             &filters,
@@ -408,6 +419,7 @@ impl Interpreter {
                         }
                     }
                 }
+                self.screen.redraw_requested = true;
             }
             /* DXYN: Display */
             (0xD, _, _, _) => {
@@ -428,6 +440,7 @@ impl Interpreter {
                         }
                     }
                 }
+                self.screen.redraw_requested = true;
             }
             /* EX9E: Skip if pressed */
             (0xE, _, 0x9, 0xE) => {
@@ -538,15 +551,10 @@ impl Interpreter {
     }
 
     pub fn run(mut self, run_flag: Arc<AtomicBool>) {
-        // Initialize audio stream
-        let (_stream, stream_handle) = OutputStream::try_default().unwrap();
-        let audio_stream = Sink::try_new(&stream_handle).unwrap();
-        let beep = SineWave::new(440.0)
-            .take_duration(Duration::from_secs(1))
-            .amplify(0.20);
-
         // Load program
         self.get_rom();
+
+        let mut step = Debug::CanStep;
 
         // Event loop
         'running: while run_flag.load(Ordering::Relaxed)
@@ -560,6 +568,13 @@ impl Interpreter {
                     },
                     Event::KeyDown { keycode: Some(Keycode::Space), .. } => {
                         self.paused = !self.paused;
+                        step = Debug::CanStep;
+                    }
+                    Event::KeyDown { keycode: Some(Keycode::Right), .. } => {
+                        if step == Debug::CanStep { step = Debug::ShouldStep }
+                    }
+                    Event::KeyUp { keycode: Some(Keycode::Right), .. } => {
+                        step = Debug::CanStep
                     }
                     Event::KeyDown { keycode: Some(Keycode::O), .. } => {
                         self.get_rom();
@@ -574,23 +589,12 @@ impl Interpreter {
                 }
             }
 
-            // Decrement timers and play sound
-            if self.timer_interrupt.irq() {
-                if self.delay_timer > 0 {
-                    info!("XXXX: DELAY = {} - 1", self.delay_timer);
-                    self.delay_timer -= 1;
-                }
-                if self.sound_timer > 0 {
-                    info!("XXXX: SOUND = {} - 1", self.sound_timer);
-                    self.sound_timer -= 1;
-                }
-                if !self.quiet {
-                    if self.sound_timer > 0 {
-                        audio_stream.append(beep.clone());
-                    } else if !audio_stream.empty() {
-                        audio_stream.stop();
-                    }
-                }
+            // Insert new program and reset interpreter if program was changed
+            if self.program_changed.load(Ordering::Relaxed) {
+                let program = self.program.lock().unwrap().clone().unwrap();
+                self.reset();
+                self.insert_data(PROGRAM_ADDR, &program);
+                self.program_changed.store(false, Ordering::Relaxed);
             }
 
             // Redraw screen
@@ -603,17 +607,28 @@ impl Interpreter {
                 continue;
             }
 
-            // Insert new program and reset interpreter if program was changed
-            if  self.program_changed.load(Ordering::Relaxed) {
-                let program = self.program.lock().unwrap().clone().unwrap();
-                self.reset();
-                self.insert_data(PROGRAM_ADDR, &program);
-                self.program_changed.store(false, Ordering::Relaxed);
+            // Stop executing if no program is loaded or paused, allow debug stepping
+            if step != Debug::ShouldStep && (self.program.lock().unwrap().is_none() || self.paused) {
+                continue;
             }
 
-            // Stop executing if no program is loaded or paused
-            if self.program.lock().unwrap().is_none() || self.memory[PROGRAM_ADDR + 1] == 0 || self.paused {
-                continue;
+            // Decrement timers and play sound
+            if self.timer_interrupt.irq() {
+                if self.delay_timer > 0 {
+                    self.delay_timer -= 1;
+                    info!("XXXX: DELAY -= 1 = {}", self.delay_timer);
+                }
+                if self.sound_timer > 0 {
+                    self.sound_timer -= 1;
+                    info!("XXXX: SOUND -= 1 = {}", self.sound_timer);
+                }
+                if !self.quiet {
+                    if self.sound_timer > 0 {
+                        self.audio.start_beep();
+                    } else {
+                        self.audio.stop_beep();
+                    }
+                }
             }
 
             // Fetch and execute instructions
@@ -621,6 +636,8 @@ impl Interpreter {
                 let int = self.fetch_instruction();
                 self.execute_instruction(int);
             }
+
+            step = Debug::HasStepped;
         }
     }
 }

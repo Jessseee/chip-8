@@ -2,6 +2,7 @@ mod screen;
 mod keypad;
 mod interpreter;
 mod platform;
+mod audio;
 
 #[macro_use]
 extern crate paris;
