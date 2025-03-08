@@ -3,6 +3,7 @@ use std::fmt::{Display, Formatter};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::sleep;
 use std::time::{Duration, Instant};
 use rand::random;
 use sdl3::dialog::{show_open_file_dialog, DialogCallback, DialogFileFilter};
@@ -92,6 +93,11 @@ impl Interrupt {
             self.next = Instant::now() + self.interval;
             true
         }
+    }
+
+    pub fn sleep_until_next_irq(&mut self) {
+        sleep(self.next.duration_since(Instant::now()));
+        self.next = Instant::now() + self.interval;
     }
 }
 
@@ -412,10 +418,12 @@ impl Interpreter {
                 for (dy, row) in (0..int.n as u32).zip(rows) {
                     for dx in 0..8 {
                         if (row >> (7 - dx)) & 1 == 1 {
-                            self.screen.draw_point(
+                            if self.screen.draw_point(
                                 (x + dx) % self.screen.width,
                                 (y + dy) % self.screen.height
-                            );
+                            ) {
+                                self.vars[0xF] = 1;
+                            }
                         }
                     }
                 }
@@ -433,10 +441,12 @@ impl Interpreter {
                     for dx in 0..8 {
                         if x + dx >= (self.screen.width) { break; }
                         if (row >> (7 - dx)) & 1 == 1 {
-                            self.screen.draw_point(
+                            if self.screen.draw_point(
                                 x + dx,
                                 y + dy
-                            );
+                            ) {
+                                self.vars[0xF] = 1;
+                            }
                         }
                     }
                 }
@@ -499,7 +509,7 @@ impl Interpreter {
             }
             /* FX29: Font character */
             (0xF, _, 0x2, 0x9) => {
-                let addr = FONT_ADDR + vx as usize;
+                let addr = FONT_ADDR + vx as usize * 5;
                 info!("{:04}: {} -> Set index to font character at {:04X}", from, int, addr);
                 self.index = addr;
             }
@@ -559,6 +569,9 @@ impl Interpreter {
         // Event loop
         'running: while run_flag.load(Ordering::Relaxed)
         {
+            // Slow down execution to platform clock speed
+            self.clock_interrupt.sleep_until_next_irq();
+
             // Handle window events
             if let Some(event) = self.events.poll_event() {
                 match event {
@@ -632,10 +645,8 @@ impl Interpreter {
             }
 
             // Fetch and execute instructions
-            if self.clock_interrupt.irq() {
-                let int = self.fetch_instruction();
-                self.execute_instruction(int);
-            }
+            let int = self.fetch_instruction();
+            self.execute_instruction(int);
 
             step = Debug::HasStepped;
         }
