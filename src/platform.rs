@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::Debug;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 #[derive(clap::ValueEnum, Clone, Default, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all="camelCase")]
@@ -30,15 +30,31 @@ pub enum Quirk {
     Logic,
 }
 
+pub fn deserialize_display_resolutions<'de, D>(deserializer: D) -> Result<Vec<(u32, u32)>, D::Error>
+where D: Deserializer<'de> {
+    let buf: Vec<String> = Vec::deserialize(deserializer)?;
+    let display_resolutions = buf.iter().map(|resolution| {
+        let resolution: Vec<u32> = resolution
+            .splitn(2, "x")
+            .flat_map(|i| i.parse())
+            .collect();
+        let width = resolution[0];
+        let height = resolution[1];
+        (width, height)
+    }).collect();
+    Ok(display_resolutions)
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all="camelCase")]
 pub struct Platform {
     pub id: PlatformId,
     pub name: String,
     pub description: String,
-    pub display_resolutions: Vec<String>,
+    #[serde(deserialize_with="deserialize_display_resolutions")]
+    pub display_resolutions: Vec<(u32, u32)>,
     pub default_tickrate: u64,
-    pub quirks: HashMap<Quirk, bool>
+    pub quirks: HashMap<Quirk, bool>,
 }
 
 impl Platform {
@@ -51,14 +67,5 @@ impl Platform {
             .ok_or(format!("Failed to initialize platform {:?}", platform_id))?
             .clone();
         Ok(platform)
-    }
-
-    pub fn resolutions(&self) -> Vec<(u32, u32)> {
-        self.display_resolutions.iter().map(|resolution| {
-            let resolution: Vec<u32> = resolution.splitn(2, "x").flat_map(|i| i.parse()).collect();
-            let width = resolution[0];
-            let height = resolution[1];
-            (width, height)
-        }).collect()
     }
 }

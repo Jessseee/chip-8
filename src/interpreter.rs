@@ -1,5 +1,6 @@
-use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
+use std::fs::File;
+use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,9 +20,12 @@ use crate::audio::Audio;
 
 const MEMORY_SIZE: usize = 4096;
 const NUM_VAR_REGS: usize = 16;
+const NUM_FLAG_REGS: usize = 8;
 const PROGRAM_ADDR: usize = 0x200;
 const FONT_ADDR: usize = 0x050;
-const FONT: [u8; 80] = [
+const BIG_FONT_ADDR: usize = 0x050 + 80;
+const FONT_SET: [u8; 180] = [
+    // Regular font
     0xF0, 0x90, 0x90, 0x90, 0xF0, // 0
     0x20, 0x60, 0x20, 0x20, 0x70, // 1
     0xF0, 0x10, 0xF0, 0x80, 0xF0, // 2
@@ -38,6 +42,17 @@ const FONT: [u8; 80] = [
     0xE0, 0x90, 0x90, 0x90, 0xE0, // D
     0xF0, 0x80, 0xF0, 0x80, 0xF0, // E
     0xF0, 0x80, 0xF0, 0x80, 0x80, // F
+    // Large font
+    0x3C, 0x7E, 0xE7, 0xC3, 0xC3, 0xC3, 0xC3, 0xE7, 0x7E, 0x3C, // 0
+    0x18, 0x38, 0x58, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x3C, // 1
+    0x3E, 0x7F, 0xC3, 0x06, 0x0C, 0x18, 0x30, 0x60, 0xFF, 0xFF, // 2
+    0x3C, 0x7E, 0xC3, 0x03, 0x0E, 0x0E, 0x03, 0xC3, 0x7E, 0x3C, // 3
+    0x06, 0x0E, 0x1E, 0x36, 0x66, 0xC6, 0xFF, 0xFF, 0x06, 0x06, // 4
+    0xFF, 0xFF, 0xC0, 0xC0, 0xFC, 0xFE, 0x03, 0xC3, 0x7E, 0x3C, // 5
+    0x3E, 0x7C, 0xE0, 0xC0, 0xFC, 0xFE, 0xC3, 0xC3, 0x7E, 0x3C, // 6
+    0xFF, 0xFF, 0x03, 0x06, 0x0C, 0x18, 0x30, 0x60, 0x60, 0x60, // 7
+    0x3C, 0x7E, 0xC3, 0xC3, 0x7E, 0x7E, 0xC3, 0xC3, 0x7E, 0x3C, // 8
+    0x3C, 0x7E, 0xC3, 0xC3, 0x7F, 0x3F, 0x03, 0x03, 0x3E, 0x7C, // 9
 ];
 
 struct Instruction {
@@ -109,7 +124,7 @@ enum Debug {
 }
 
 pub struct Interpreter {
-    quirks: HashMap<Quirk, bool>,
+    platform: Platform,
     program: Arc<Mutex<Option<Vec<u8>>>>,
     program_changed: Arc<AtomicBool>,
     events: EventPump,
@@ -118,6 +133,7 @@ pub struct Interpreter {
     audio: Audio,
     memory: [u8; MEMORY_SIZE],
     vars: [u8; NUM_VAR_REGS],
+    flags: [u8; NUM_FLAG_REGS],
     stack: Vec<usize>,
     pc: usize,
     index: usize,
@@ -133,12 +149,13 @@ pub struct Interpreter {
 
 impl Interpreter {
     pub fn new(args: &Args, platform: Platform) -> Self {
-        let resolutions = platform.resolutions();
+        let clock_speed = platform.default_tickrate * 60;
+        let resolutions = platform.display_resolutions.clone();
         let (width, height) = resolutions.last().unwrap();
         let window_title = format!("CHIP-8 | {:?}", platform.id);
         let (window, event_pump, audio) = Self::open_window(width, height, args.scale, window_title);
         let mut interpreter = Self {
-            quirks: platform.quirks,
+            platform,
             program: Arc::new(Mutex::new(None)),
             program_changed: Arc::new(AtomicBool::new(false)),
             events: event_pump,
@@ -147,6 +164,7 @@ impl Interpreter {
             audio: Audio::new(audio),
             memory: [0; MEMORY_SIZE],
             vars: [0u8; NUM_VAR_REGS],
+            flags: Self::read_flag_registers(),
             stack: Vec::new(),
             pc: PROGRAM_ADDR,
             index: 0,
@@ -157,23 +175,10 @@ impl Interpreter {
             quiet: args.quiet,
             display_interrupt: Interrupt::new(60),
             timer_interrupt: Interrupt::new(60),
-            clock_interrupt: Interrupt::new(platform.default_tickrate * 60),
+            clock_interrupt: Interrupt::new(clock_speed),
         };
-        interpreter.insert_data(FONT_ADDR, &FONT);
+        interpreter.insert_data(FONT_ADDR, &FONT_SET);
         interpreter
-    }
-
-    fn reset(&mut self) {
-        self.memory = [0; MEMORY_SIZE];
-        self.insert_data(FONT_ADDR, &FONT);
-        self.pc = PROGRAM_ADDR;
-        self.vars = [0u8; NUM_VAR_REGS];
-        self.stack = Vec::new();
-        self.delay_timer = 0;
-        self.sound_timer = 0;
-        self.paused = false;
-        self.wait_input = false;
-        self.screen.clear();
     }
 
     fn open_window(width: &u32, height: &u32, scale: f32, window_title: String) -> (Window, EventPump, AudioSubsystem) {
@@ -186,6 +191,42 @@ impl Interpreter {
         let event_pump = sdl_context.event_pump().unwrap();
         let audio = sdl_context.audio().unwrap();
         (window, event_pump, audio)
+    }
+
+    fn read_flag_registers() -> [u8; NUM_FLAG_REGS] {
+        if let Some(local_data_path) = dirs::data_local_dir() {
+            let file_path = local_data_path.join("chip-8/flags.json");
+            if file_path.is_file() {
+                let file = File::open(file_path).expect("Failed to open flags.json file.");
+                return serde_json::from_reader(file).expect("Failed to read flags.json.")
+            }
+        }
+        [0u8; NUM_FLAG_REGS]
+    }
+
+    fn write_flag_registers(&self) {
+        if let Some(local_data_path) = dirs::data_local_dir() {
+            let path = local_data_path.join("chip-8");
+            if !path.is_dir() { std::fs::create_dir(&path).expect("failed to create data folder.") }
+            let file_path = path.join("flags.json");
+            let file = File::create(file_path).expect("Failed to open flags.json file.");
+            let mut writer = BufWriter::new(file);
+            serde_json::to_writer(&mut writer, &self.flags).unwrap();
+            writer.flush().expect("Failed to write to flags.json.");
+        }
+    }
+
+    fn reset(&mut self) {
+        self.memory = [0; MEMORY_SIZE];
+        self.insert_data(FONT_ADDR, &FONT_SET);
+        self.pc = PROGRAM_ADDR;
+        self.vars = [0u8; NUM_VAR_REGS];
+        self.stack = Vec::new();
+        self.delay_timer = 0;
+        self.sound_timer = 0;
+        self.paused = false;
+        self.wait_input = false;
+        self.screen.clear();
     }
 
     fn get_rom(&self) {
@@ -219,8 +260,12 @@ impl Interpreter {
         self
     }
 
+    fn read_word(&self, addr: usize) -> u16 {
+        ((self.memory[addr] as u16) << 8) | self.memory[addr + 1] as u16
+    }
+
     fn fetch_instruction(&mut self) -> Instruction {
-        Instruction::new(((self.memory[self.pc] as u16) << 8) | self.memory[self.pc + 1] as u16)
+        Instruction::new(self.read_word(self.pc))
     }
 
     fn execute_instruction(&mut self, int: Instruction) {
@@ -245,6 +290,29 @@ impl Interpreter {
                     .expect("XXXX: 00EE -> Error: There should be an address on the stack to return to");
                 info!("{:04}: {} -> Return to line {} from subroutine", from, int, to);
                 self.pc = to;
+            }
+            /* 00CN: Scroll down n pixels */
+            (0x0, 0x0, 0xC, _) => {
+                self.screen.scroll_down(int.n);
+            }
+            /* 00FB: Scroll right 4 pixels */
+            (0x0, 0x0, 0xF, 0xB) => {
+                self.screen.scroll_right();
+            }
+            /* 00FC: Scroll left 4 pixels */
+            (0x0, 0x0, 0xF, 0xC) =>  {
+                self.screen.scroll_left();
+            }
+            /* 00FF: Enable high resolution graphics mode */
+            (0x0, 0x0, 0xF, 0xF) if self.platform.display_resolutions.len() > 1 => {
+                info!("{:04}: {} -> Enable hires mode", from, int);
+                println!("{:?}", self.platform.display_resolutions);
+                self.screen.enable_hires();
+            }
+            /* 00FE: Disable high resolution graphics mode */
+            (0x0, 0x0, 0xF, 0xE) if self.platform.display_resolutions.len() > 1 => {
+                info!("{:04}: {} -> Disable hires mode", from, int);
+                self.screen.disable_hires();
             }
             /* 1NNN: Jump */
             (0x1, _, _, _) => {
@@ -308,7 +376,7 @@ impl Interpreter {
                 self.vars[int.x] = vy;
             }
             /* 8XY1: Binary OR - Logic quirk */
-            (0x8, _, _, 0x1) if self.quirks[&Quirk::Logic] => {
+            (0x8, _, _, 0x1) if self.platform.quirks[&Quirk::Logic] => {
                 info!("{:04}: {} -> OR V{:X}<{}> |= V{:X}<{}>", from, int, int.x, vx, int.y, vy);
                 self.vars[int.x] |= vy;
                 self.vars[0xF] = 0;
@@ -319,7 +387,7 @@ impl Interpreter {
                 self.vars[int.x] |= vy;
             }
             /* 8XY2: Binary AND - Logic quirk */
-            (0x8, _, _, 0x2) if self.quirks[&Quirk::Logic] => {
+            (0x8, _, _, 0x2) if self.platform.quirks[&Quirk::Logic] => {
                 info!("{:04}: {} -> AND V{:X}<{}> &= V{:X}<{}>", from, int, int.x, vx, int.y, vy);
                 self.vars[int.x] &= vy;
                 self.vars[0xF] = 0;
@@ -330,7 +398,7 @@ impl Interpreter {
                 self.vars[int.x] &= vy;
             }
             /* 8XY3: Binary XOR - Logic quirk */
-            (0x8, _, _, 0x3) if self.quirks[&Quirk::Logic] => {
+            (0x8, _, _, 0x3) if self.platform.quirks[&Quirk::Logic] => {
                 info!("{:04}: {} -> XOR V{:X}<{}> ^= V{:X}<{}>", from, int, int.x, vx, int.y, vy);
                 self.vars[int.x] ^= vy;
                 self.vars[0xF] = 0;
@@ -362,7 +430,7 @@ impl Interpreter {
                 self.vars[0xF] = !flag as u8;
             }
             /* 8XY6: Shift right - Shift quirk */
-            (0x8, _, _, 0x6) if self.quirks[&Quirk::Shift] => {
+            (0x8, _, _, 0x6) if self.platform.quirks[&Quirk::Shift] => {
                 info!("{:04}: {} -> Shift right V{:X} = V{2:X}<{}> >> 1", from, int, int.x, vx);
                 self.vars[int.x] = vx >> 1;
                 self.vars[0xF] = vx & 1;
@@ -374,7 +442,7 @@ impl Interpreter {
                 self.vars[0xF] = vy & 1;
             }
             /* 8XYE: Shift left - Shift quirk */
-            (0x8, _, _, 0xE) if self.quirks[&Quirk::Shift] => {
+            (0x8, _, _, 0xE) if self.platform.quirks[&Quirk::Shift] => {
                 info!("{:04}: {} -> Shift left V{:X} = V{2:X}<{}> << 1", from, int, int.x, vx);
                 self.vars[int.x] = vx << 1;
                 self.vars[0xF] = (vx >> 7) & 1;
@@ -392,7 +460,7 @@ impl Interpreter {
             }
 
             /* BNNN: Jump with offset - Jump quirk */
-            (0xB, _, _, _) if self.quirks[&Quirk::Jump] => {
+            (0xB, _, _, _) if self.platform.quirks[&Quirk::Jump] => {
                 let to = (int.nnn + vx as u16) as usize;
                 info!("{:04}: {} -> Jump with offset to line {} + V{:X}<{}> = {}", from, int, int.x, vx, self.vars[0], to);
                 self.pc = to;
@@ -408,40 +476,19 @@ impl Interpreter {
                 info!("{:04}: {} -> Random V{:X} = R + {}", from, int, int.x, int.nn);
                 self.vars[int.x] = random::<u8>() & int.nn;
             }
-            /* DXYN: Display - Wrap quirk */
-            (0xD, _, _, _) if self.quirks[&Quirk::Wrap] => {
-                info!("{:04}: {} -> Display sprite at {}, {}", from, int, vx, vy);
+            /* DXY0: Display sprite 16x16 */
+            (0xD, _, _, 0x0) => {
+                info!("{:04}: {} -> Display 16x16 sprite at {}, {}", from, int, vx, vy);
                 let x = vx as u32 % self.screen.width;
                 let y = vy as u32 % self.screen.height;
                 self.vars[0xF] = 0;
-                let rows = &self.memory[self.index..self.index + int.n as usize];
-                for (dy, row) in (0..int.n as u32).zip(rows) {
-                    for dx in 0..8 {
-                        if (row >> (7 - dx)) & 1 == 1 {
-                            if self.screen.draw_point(
-                                (x + dx) % self.screen.width,
-                                (y + dy) % self.screen.height
-                            ) {
-                                self.vars[0xF] = 1;
-                            }
-                        }
-                    }
-                }
-                self.screen.redraw_requested = true;
-            }
-            /* DXYN: Display */
-            (0xD, _, _, _) => {
-                info!("{:04}: {} -> Display sprite at {}, {}", from, int, vx, vy);
-                let x = vx as u32 % self.screen.width;
-                let y = vy as u32 % self.screen.height;
-                self.vars[0xF] = 0;
-                let rows = &self.memory[self.index..self.index + int.n as usize];
-                for (dy, row) in (0..int.n as u32).zip(rows) {
+                for dy in 0..16u32 {
+                    let row = self.read_word(self.index + dy as usize * 2);
                     if y + dy >= (self.screen.height) { break; }
-                    for dx in 0..8 {
+                    for dx in 0..16 {
                         if x + dx >= (self.screen.width) { break; }
-                        if (row >> (7 - dx)) & 1 == 1 {
-                            if self.screen.draw_point(
+                        if (row >> (15 - dx)) & 1 == 1 {
+                            if self.screen.toggle_pixel(
                                 x + dx,
                                 y + dy
                             ) {
@@ -450,7 +497,48 @@ impl Interpreter {
                         }
                     }
                 }
-                self.screen.redraw_requested = true;
+            }
+            /* DXYN: Display sprite - Wrap quirk */
+            (0xD, _, _, _) if self.platform.quirks[&Quirk::Wrap] => {
+                info!("{:04}: {} -> Display 8x8 sprite at {}, {}", from, int, vx, vy);
+                let x = vx as u32 % self.screen.width;
+                let y = vy as u32 % self.screen.height;
+                self.vars[0xF] = 0;
+                for dy in 0..int.n as u32 {
+                    let row = self.memory[self.index + dy as usize];
+                    for dx in 0..8 {
+                        if (row >> (7 - dx)) & 1 == 1 {
+                            if self.screen.toggle_pixel(
+                                (x + dx) % self.screen.width,
+                                (y + dy) % self.screen.height
+                            ) {
+                                self.vars[0xF] = 1;
+                            }
+                        }
+                    }
+                }
+            }
+            /* DXYN: Display sprite */
+            (0xD, _, _, _) => {
+                info!("{:04}: {} -> Display 8x8 sprite at {}, {}", from, int, vx, vy);
+                let x = vx as u32 % self.screen.width;
+                let y = vy as u32 % self.screen.height;
+                self.vars[0xF] = 0;
+                for dy in 0..int.n as u32 {
+                    let row = self.memory[self.index + dy as usize];
+                    if y + dy >= (self.screen.height) { break; }
+                    for dx in 0..8 {
+                        if x + dx >= (self.screen.width) { break; }
+                        if (row >> (7 - dx)) & 1 == 1 {
+                            if self.screen.toggle_pixel(
+                                x + dx,
+                                y + dy
+                            ) {
+                                self.vars[0xF] = 1;
+                            }
+                        }
+                    }
+                }
             }
             /* EX9E: Skip if pressed */
             (0xE, _, 0x9, 0xE) => {
@@ -510,7 +598,13 @@ impl Interpreter {
             /* FX29: Font character */
             (0xF, _, 0x2, 0x9) => {
                 let addr = FONT_ADDR + vx as usize * 5;
-                info!("{:04}: {} -> Set index to font character at {:04X}", from, int, addr);
+                info!("{:04}: {} -> Set index to font character {:X} at {:04X}", from, int, vx, addr);
+                self.index = addr;
+            }
+            /* FX30: Large font character */
+            (0xF, _, 0x3, 0x0) => {
+                let addr = BIG_FONT_ADDR + vx as usize * 10;
+                info!("{:04}: {} -> Set index to big font character {:X} at {:04X}", from, int, vx, addr);
                 self.index = addr;
             }
             /* FX33: Binary-coded decimal conversion */
@@ -522,12 +616,12 @@ impl Interpreter {
                 self.memory[self.index + 2] = byte % 10;
             }
             /* FX55: Store variable registers into memory - Leave index unchanged quirk */
-            (0xF, _, 0x5, 0x5) if self.quirks[&Quirk::MemoryLeaveIUnchanged] => {
+            (0xF, _, 0x5, 0x5) if self.platform.quirks[&Quirk::MemoryLeaveIUnchanged] => {
                 info!("{:04}: {} -> Store V0..{} into memory[{:04X}..{:04X}]", from, int, int.x, self.index, self.index + int.x);
                 (0..=int.x).for_each(|i| self.memory[self.index + i] = self.vars[i]);
             }
             /* FX55: Store variable registers into memory - Increment index by X quirk */
-            (0xF, _, 0x5, 0x5) if self.quirks[&Quirk::MemoryIncrementByX] => {
+            (0xF, _, 0x5, 0x5) if self.platform.quirks[&Quirk::MemoryIncrementByX] => {
                 info!("{:04}: {} -> Store V0..{} into memory[{:04X}..{:04X}]", from, int, int.x, self.index, self.index + int.x);
                 (0..=int.x).for_each(|i| self.memory[self.index + i] = self.vars[i]);
                 self.index += int.x;
@@ -539,21 +633,32 @@ impl Interpreter {
                 self.index += int.x + 1;
             }
             /* FX65: Store memory into variable registers - Leave index unchanged quirk */
-            (0xF, _, 0x6, 0x5) if self.quirks[&Quirk::MemoryLeaveIUnchanged] => {
-                info!("{:04}: {} -> Store memory[{:04X}..{:04X}] into V0..{}", from, int, self.index, self.index + int.x, int.x);
+            (0xF, _, 0x6, 0x5) if self.platform.quirks[&Quirk::MemoryLeaveIUnchanged] => {
+                info!("{:04}: {} -> Store memory[{:04X}..{:04X}] into V0..{:X}", from, int, self.index, self.index + int.x, int.x);
                 (0..=int.x).for_each(|i| self.vars[i] = self.memory[self.index + i]);
             }
             /* FX65: Store memory into variable registers - Increment index by X quirk */
-            (0xF, _, 0x6, 0x5) if self.quirks[&Quirk::MemoryIncrementByX] => {
-                info!("{:04}: {} -> Store memory[{:04X}..{:04X}] into V0..{}", from, int, self.index, self.index + int.x, int.x);
+            (0xF, _, 0x6, 0x5) if self.platform.quirks[&Quirk::MemoryIncrementByX] => {
+                info!("{:04}: {} -> Store memory[{:04X}..{:04X}] into V0..{:X}", from, int, self.index, self.index + int.x, int.x);
                 (0..=int.x).for_each(|i| self.vars[i] = self.memory[self.index + i]);
                  self.index += int.x;
             }
             /* FX65: Store memory into variable registers */
             (0xF, _, 0x6, 0x5) => {
-                info!("{:04}: {} -> Store memory[{:04X}..{:04X}] into V0..{}", from, int, self.index, self.index + int.x, int.x);
+                info!("{:04}: {} -> Store memory[{:04X}..{:04X}] into V0..{:X}", from, int, self.index, self.index + int.x, int.x);
                 (0..=int.x).for_each(|i| self.vars[i] = self.memory[self.index + i]);
                 self.index += int.x + 1;
+            }
+            /* FX75: Store variables to flag registers */
+            (0xF, _, 0x7, 0x5) => {
+                info!("{:04}: {} -> Store V0..{} into F0..{2:X} ", from, int, int.x);
+                (0..=int.x).for_each(|i| self.flags[i] = self.vars[i]);
+                self.write_flag_registers()
+            }
+            /* FX75: Store flag registers to variables */
+            (0xF, _, 0x8, 0x5) => {
+                info!("{:04}: {} -> Store F0..{:X} into V0..{2:X}", from, int, int.x);
+                (0..=int.x).for_each(|i| self.vars[i] = self.flags[i])
             }
             /* Unknown instruction */
             _ => panic!("Unknown instruction at {}: {}", self.pc, int),
@@ -612,11 +717,13 @@ impl Interpreter {
 
             // Redraw screen
             if self.display_interrupt.irq() {
-                self.screen.redraw();
+                if self.screen.redraw() {
+                    info!("XXXX: DISPLAY -> Redraw")
+                }
             }
 
             // Wait for screen redraw before executing next instruction
-            if self.quirks[&Quirk::Vblank] && self.screen.redraw_requested {
+            if self.platform.quirks[&Quirk::Vblank] && self.screen.redraw_requested {
                 continue;
             }
 
@@ -628,12 +735,12 @@ impl Interpreter {
             // Decrement timers and play sound
             if self.timer_interrupt.irq() {
                 if self.delay_timer > 0 {
+                    info!("XXXX: DELAY -> {} - 1", self.delay_timer);
                     self.delay_timer -= 1;
-                    info!("XXXX: DELAY -= 1 = {}", self.delay_timer);
                 }
                 if self.sound_timer > 0 {
+                    info!("XXXX: SOUND -> {} - 1", self.sound_timer);
                     self.sound_timer -= 1;
-                    info!("XXXX: SOUND -= 1 = {}", self.sound_timer);
                 }
                 if !self.quiet {
                     if self.sound_timer > 0 {
