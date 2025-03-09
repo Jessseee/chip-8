@@ -4,7 +4,7 @@ use sdl3::video::Window;
 
 pub struct Screen {
     pub(crate) canvas: Canvas<Window>,
-    buffer: Vec<bool>,
+    pub buffer: Vec<bool>,
     resolutions: Vec<(u32, u32)>,
     current_resolution: usize,
     pub width: u32,

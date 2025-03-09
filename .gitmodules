@@ -1,3 +1,6 @@
 [submodule "chip-8-database"]
 	path = chip-8-database
 	url = https://github.com/chip-8/chip-8-database.git
+[submodule "chip8-test-suite"]
+	path = chip8-test-suite
+	url = git@github.com:Timendus/chip8-test-suite.git

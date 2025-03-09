@@ -6,17 +6,37 @@ use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
+use clap::Parser;
 use rand::random;
 use sdl3::dialog::{show_open_file_dialog, DialogCallback, DialogFileFilter};
 use sdl3::event::Event;
 use sdl3::{AudioSubsystem, EventPump};
 use sdl3::keyboard::Keycode;
 use sdl3::video::Window;
-use crate::Args;
-use crate::platform::{Platform, Quirk};
+use crate::platform::{Platform, PlatformId, Quirk};
 use crate::keypad::Keypad;
 use crate::screen::Screen;
 use crate::audio::Audio;
+
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+pub struct Args {
+    #[arg(short, long)]
+    #[clap(help="To beep or not to beep?")]
+    pub quiet: bool,
+    #[arg(short, long)]
+    #[clap(default_value="12", help="Screen pixel scale.")]
+    pub scale: f32,
+    #[arg(long, short)]
+    #[clap(default_value="original-chip8", help="CHIP-8 implementation.")]
+    pub platform: PlatformId,
+}
+
+impl Default for Args {
+    fn default() -> Self {
+        Self { quiet: true, scale: 12., platform: PlatformId::OriginalChip8 }
+    }
+}
 
 const MEMORY_SIZE: usize = 4096;
 const NUM_VAR_REGS: usize = 16;
@@ -124,24 +144,24 @@ enum Debug {
 }
 
 pub struct Interpreter {
+    pub keypad: Keypad,
+    pub screen: Screen,
+    pub audio: Audio,
+    pub memory: [u8; MEMORY_SIZE],
+    pub vars: [u8; NUM_VAR_REGS],
+    pub flags: [u8; NUM_FLAG_REGS],
+    pub stack: Vec<usize>,
+    pub wait_input: bool,
+    pub quiet: bool,
     platform: Platform,
     program: Arc<Mutex<Option<Vec<u8>>>>,
     program_changed: Arc<AtomicBool>,
     events: EventPump,
-    keypad: Keypad,
-    screen: Screen,
-    audio: Audio,
-    memory: [u8; MEMORY_SIZE],
-    vars: [u8; NUM_VAR_REGS],
-    flags: [u8; NUM_FLAG_REGS],
-    stack: Vec<usize>,
     pc: usize,
     index: usize,
     delay_timer: u8,
     sound_timer: u8,
     paused: bool,
-    wait_input: bool,
-    quiet: bool,
     display_interrupt: Interrupt,
     timer_interrupt: Interrupt,
     clock_interrupt: Interrupt,
@@ -178,6 +198,13 @@ impl Interpreter {
             clock_interrupt: Interrupt::new(clock_speed),
         };
         interpreter.insert_data(FONT_ADDR, &FONT_SET);
+        interpreter
+    }
+
+    pub fn with_program(args: &Args, platform: Platform, program: Vec<u8>) -> Self {
+        let mut interpreter = Self::new(args, platform);
+        interpreter.insert_data(PROGRAM_ADDR, &program);
+        interpreter.program = Arc::new(Mutex::new(Some(program)));
         interpreter
     }
 
@@ -230,11 +257,11 @@ impl Interpreter {
     }
 
     fn get_rom(&self) {
-        let program_clone = Arc::clone(&self.program);
+        let program = Arc::clone(&self.program);
         let program_changed = Arc::clone(&self.program_changed);
         let callback: DialogCallback = Box::new(move |result, _filters| {
             let paths = result.ok();
-            *program_clone.lock().unwrap() = Some(
+            *program.lock().unwrap() = Some(
                 match paths {
                     Some(paths) => std::fs::read(paths.first().unwrap())
                         .expect("Failed to read selected program."),
@@ -665,9 +692,48 @@ impl Interpreter {
         }
     }
 
-    pub fn run(mut self, run_flag: Arc<AtomicBool>) {
+    pub fn cycle(&mut self) {
+        // Redraw screen
+        if self.display_interrupt.irq() {
+            if self.screen.redraw() {
+                info!("XXXX: DISPLAY -> Redraw")
+            }
+        }
+
+        // Decrement timers and play sound
+        if self.timer_interrupt.irq() {
+            if self.delay_timer > 0 {
+                info!("XXXX: DELAY -> {} - 1", self.delay_timer);
+                self.delay_timer -= 1;
+            }
+            if self.sound_timer > 0 {
+                info!("XXXX: SOUND -> {} - 1", self.sound_timer);
+                self.sound_timer -= 1;
+            }
+            if !self.quiet {
+                if self.sound_timer > 0 {
+                    self.audio.start_beep();
+                } else {
+                    self.audio.stop_beep();
+                }
+            }
+        }
+
+        // Wait for screen redraw before executing next instruction
+        if self.platform.quirks[&Quirk::Vblank] && self.screen.redraw_requested {
+            return;
+        }
+
+        // Fetch and execute instructions
+        let int = self.fetch_instruction();
+        self.execute_instruction(int);
+    }
+
+    pub fn run(&mut self, run_flag: Arc<AtomicBool>) {
         // Load program
-        self.get_rom();
+        if self.program.lock().unwrap().is_none() {
+            self.get_rom();
+        }
 
         let mut step = Debug::CanStep;
 
@@ -680,26 +746,33 @@ impl Interpreter {
             // Handle window events
             if let Some(event) = self.events.poll_event() {
                 match event {
+                    /* Stop interpreter */
                     Event::Quit {..} |
                     Event::KeyDown { keycode: Some(Keycode::Escape), .. } => {
                         break 'running
                     },
+                    /* Pause interpreter and enable debug stepping */
                     Event::KeyDown { keycode: Some(Keycode::Space), .. } => {
                         self.paused = !self.paused;
                         step = Debug::CanStep;
                     }
+                    /* Start debug step */
                     Event::KeyDown { keycode: Some(Keycode::Right), .. } => {
                         if step == Debug::CanStep { step = Debug::ShouldStep }
                     }
+                    /* Reset debug step state */
                     Event::KeyUp { keycode: Some(Keycode::Right), .. } => {
                         step = Debug::CanStep
                     }
+                    /* Get a new ROM and reset interpreter */
                     Event::KeyDown { keycode: Some(Keycode::O), .. } => {
                         self.get_rom();
                     }
+                    /* Handle keypad keydown event */
                     Event::KeyDown { keycode: Some(key), .. } => {
                         self.keypad.handle_keydown(key);
                     }
+                    /* Handle keypad keyup event */
                     Event::KeyUp { keycode: Some(key), .. } => {
                         self.keypad.handle_keyup(key);
                     }
@@ -715,46 +788,15 @@ impl Interpreter {
                 self.program_changed.store(false, Ordering::Relaxed);
             }
 
-            // Redraw screen
-            if self.display_interrupt.irq() {
-                if self.screen.redraw() {
-                    info!("XXXX: DISPLAY -> Redraw")
-                }
-            }
-
-            // Wait for screen redraw before executing next instruction
-            if self.platform.quirks[&Quirk::Vblank] && self.screen.redraw_requested {
-                continue;
-            }
-
             // Stop executing if no program is loaded or paused, allow debug stepping
             if step != Debug::ShouldStep && (self.program.lock().unwrap().is_none() || self.paused) {
                 continue;
             }
 
-            // Decrement timers and play sound
-            if self.timer_interrupt.irq() {
-                if self.delay_timer > 0 {
-                    info!("XXXX: DELAY -> {} - 1", self.delay_timer);
-                    self.delay_timer -= 1;
-                }
-                if self.sound_timer > 0 {
-                    info!("XXXX: SOUND -> {} - 1", self.sound_timer);
-                    self.sound_timer -= 1;
-                }
-                if !self.quiet {
-                    if self.sound_timer > 0 {
-                        self.audio.start_beep();
-                    } else {
-                        self.audio.stop_beep();
-                    }
-                }
-            }
+            // Run clock cycle
+            self.cycle();
 
-            // Fetch and execute instructions
-            let int = self.fetch_instruction();
-            self.execute_instruction(int);
-
+            // Stop debug step from repeating until key is released
             step = Debug::HasStepped;
         }
     }

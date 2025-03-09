@@ -1,31 +1,8 @@
-mod screen;
-mod keypad;
-mod interpreter;
-mod platform;
-mod audio;
-
-#[macro_use]
-extern crate paris;
-
 use clap::Parser;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use crate::platform::{Platform, PlatformId};
-use crate::interpreter::Interpreter;
-
-#[derive(Parser, Debug)]
-#[command(version, about, long_about = None)]
-pub struct Args {
-    #[arg(short, long)]
-    #[clap(help="To beep or not to beep?")]
-    pub quiet: bool,
-    #[arg(short, long)]
-    #[clap(default_value="12", help="Screen pixel scale.")]
-    pub scale: f32,
-    #[arg(long, short)]
-    #[clap(default_value="original-chip8", help="CHIP-8 implementation.")]
-    pub platform: PlatformId,
-}
+use chip8::platform::Platform;
+use chip8::interpreter::{Args, Interpreter};
 
 fn main() {
     // Parse command line arguments
