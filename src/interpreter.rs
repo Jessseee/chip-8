@@ -11,7 +11,9 @@ use rand::random;
 use sdl3::dialog::{show_open_file_dialog, DialogCallback, DialogFileFilter};
 use sdl3::event::Event;
 use sdl3::{AudioSubsystem, EventPump};
+use sdl3::image::LoadSurface;
 use sdl3::keyboard::Keycode;
+use sdl3::surface::Surface;
 use sdl3::video::Window;
 use crate::platform::{Platform, PlatformId, Quirk};
 use crate::keypad::Keypad;
@@ -211,10 +213,22 @@ impl Interpreter {
     fn open_window(width: &u32, height: &u32, scale: f32, window_title: String) -> (Window, EventPump, AudioSubsystem) {
         let sdl_context = sdl3::init().unwrap();
         let video_subsystem = sdl_context.video().unwrap();
-        let window = video_subsystem.window(&window_title, width * scale as u32, height * scale as u32)
+        let mut window = video_subsystem.window(&window_title, width * scale as u32, height * scale as u32)
             .position_centered()
             .build()
             .unwrap();
+
+        let file = std::env::current_exe().ok()
+            .and_then(|path| path.parent().and_then(|path| Some(path.to_path_buf())))
+            .and_then(|path| Some(path.join("icon.png")))
+            .take_if(|path| path.is_file());
+        if let Some(file) = file {
+            let icon = Surface::from_file(file);
+            window.set_icon(icon.unwrap());
+        } else {
+            warn!("No icon.png found near executable!");
+        }
+
         let event_pump = sdl_context.event_pump().unwrap();
         let audio = sdl_context.audio().unwrap();
         (window, event_pump, audio)
@@ -295,11 +309,19 @@ impl Interpreter {
         Instruction::new(self.read_word(self.pc))
     }
 
+    fn skip_instruction(&mut self) {
+        self.pc += 2;
+        // Skip another instruction if next instruction is double length
+        if self.fetch_instruction().nibbles == (0xF, 0x0, 0x0, 0x0) {
+            self.pc += 2
+        }
+    }
+
     fn execute_instruction(&mut self, int: Instruction) {
+        let keys = self.keypad.get_keys();
         let (vx, vy) = (self.vars[int.x], self.vars[int.y]);
         let from = self.pc; // Hold on to the position of the current instruction to detect loops
         self.pc += 2; // Increment program counter to next instruction
-        let keys = self.keypad.get_keys();
 
         match int.nibbles {
             /* 0000: NOP, do nothing */
@@ -322,6 +344,9 @@ impl Interpreter {
             (0x0, 0x0, 0xC, _) => {
                 self.screen.scroll_down(int.n);
             }
+            (0x0, 0x0, 0xD, _) => {
+                self.screen.scroll_up(int.n);
+            }
             /* 00FB: Scroll right 4 pixels */
             (0x0, 0x0, 0xF, 0xB) => {
                 self.screen.scroll_right();
@@ -333,7 +358,6 @@ impl Interpreter {
             /* 00FF: Enable high resolution graphics mode */
             (0x0, 0x0, 0xF, 0xF) if self.platform.display_resolutions.len() > 1 => {
                 info!("{:04}: {} -> Enable hires mode", from, int);
-                println!("{:?}", self.platform.display_resolutions);
                 self.screen.enable_hires();
             }
             /* 00FE: Disable high resolution graphics mode */
@@ -363,28 +387,38 @@ impl Interpreter {
             (0x3, _, _, _) => {
                 info!("{:04}: {} -> Skip if {} == {}", from, int, vx, int.nn);
                 if vx == int.nn {
-                    self.pc += 2;
+                    self.skip_instruction();
                 }
             }
             /* 4XNN: Skip if VX != NN */
             (0x4, _, _, _) => {
                 info!("{:04}: {} -> Skip if {} != {}", from, int, vx, int.nn);
                 if vx != int.nn {
-                    self.pc += 2;
+                    self.skip_instruction();
                 }
             }
             /* 5XY0: Skip if VX == VY */
-            (0x5, _, _, _) => {
+            (0x5, _, _, 0x0) => {
                 info!("{:04}: {} -> Skip if {} == {}", from, int, vx, vy);
                 if vx == vy {
-                    self.pc += 2;
+                    self.skip_instruction();
                 }
             }
+            /* 5XY2: Store range of variable registers into memory */
+            (0x5, _, _, 0x2) => {
+                info!("{:04}: {} -> Store V{:X}..V{:X} into memory[{:04X}..{:04X}]", from, int, int.x, int.y, self.index, self.index + int.y - int.x);
+                (int.x..=int.y).for_each(|i| self.memory[self.index + i] = self.vars[i]);
+            }
+            /* 5XY3: Store memory into range of variable registers */
+            (0x5, _, _, 0x3) => {
+                info!("{:04}: {} -> Store memory[{:04X}..{:04X}] into V{:X}..{:X}", from, int, self.index, self.index + int.y - int.x, int.x, int.y);
+                (0..=int.x).for_each(|i| self.vars[i] = self.memory[self.index + i]);
+            }
             /* 9XY0: Skip if VX != VY */
-            (0x9, _, _, _) => {
+            (0x9, _, _, 0x0) => {
                 info!("{:04}: {} -> Skip if {} != {}", from, int, vx, vy);
                 if vx != vy {
-                    self.pc += 2;
+                    self.skip_instruction();
                 }
             }
             /* 6XNN: Set */
@@ -504,74 +538,54 @@ impl Interpreter {
                 self.vars[int.x] = random::<u8>() & int.nn;
             }
             /* DXY0: Display sprite 16x16 */
-            (0xD, _, _, 0x0) => {
+            (0xD, _, _, 0x0) if self.platform.id == PlatformId::Xochip => {
                 info!("{:04}: {} -> Display 16x16 sprite at {}, {}", from, int, vx, vy);
                 let x = vx as u32 % self.screen.width;
                 let y = vy as u32 % self.screen.height;
                 self.vars[0xF] = 0;
-                for dy in 0..16u32 {
-                    let row = self.read_word(self.index + dy as usize * 2);
-                    if y + dy >= (self.screen.height) { break; }
-                    for dx in 0..16 {
-                        if x + dx >= (self.screen.width) { break; }
-                        if (row >> (15 - dx)) & 1 == 1 {
-                            if self.screen.toggle_pixel(
-                                x + dx,
-                                y + dy
-                            ) {
-                                self.vars[0xF] = 1;
-                            }
-                        }
-                    }
+                let mut addr = self.index;
+                for &plane in self.screen.selected_planes.clone().iter() {
+                    let sprite: Vec<u16> = (0..16).map(|i| {
+                        self.read_word(addr + i as usize * 2)
+                    }).collect();
+                    let flag = self.screen.draw_sprite_large(x, y, &sprite, plane);
+                    if flag { self.vars[0xF] = 1; }
+                    addr += 16;
                 }
             }
-            /* DXYN: Display sprite - Wrap quirk */
+            /* DXYN: Display sprite 8xH - Wrap quirk */
             (0xD, _, _, _) if self.platform.quirks[&Quirk::Wrap] => {
-                info!("{:04}: {} -> Display 8x8 sprite at {}, {}", from, int, vx, vy);
+                info!("{:04}: {} -> Display 8x{} sprite at {}, {}", from, int, int.n, vx, vy);
                 let x = vx as u32 % self.screen.width;
                 let y = vy as u32 % self.screen.height;
                 self.vars[0xF] = 0;
-                for dy in 0..int.n as u32 {
-                    let row = self.memory[self.index + dy as usize];
-                    for dx in 0..8 {
-                        if (row >> (7 - dx)) & 1 == 1 {
-                            if self.screen.toggle_pixel(
-                                (x + dx) % self.screen.width,
-                                (y + dy) % self.screen.height
-                            ) {
-                                self.vars[0xF] = 1;
-                            }
-                        }
-                    }
+                let mut addr = self.index;
+                for &plane in self.screen.selected_planes.clone().iter() {
+                    let sprite = &self.memory[addr..addr + int.n as usize];
+                    let flag = self.screen.draw_sprite_wrap(x, y, sprite, plane);
+                    if flag { self.vars[0xF] = 1; }
+                    addr += int.n as usize;
                 }
             }
-            /* DXYN: Display sprite */
+            /* DXYN: Display sprite 8xH */
             (0xD, _, _, _) => {
-                info!("{:04}: {} -> Display 8x8 sprite at {}, {}", from, int, vx, vy);
+                info!("{:04}: {} -> Display 8x{} sprite at {}, {}", from, int, int.n, vx, vy);
                 let x = vx as u32 % self.screen.width;
                 let y = vy as u32 % self.screen.height;
                 self.vars[0xF] = 0;
-                for dy in 0..int.n as u32 {
-                    let row = self.memory[self.index + dy as usize];
-                    if y + dy >= (self.screen.height) { break; }
-                    for dx in 0..8 {
-                        if x + dx >= (self.screen.width) { break; }
-                        if (row >> (7 - dx)) & 1 == 1 {
-                            if self.screen.toggle_pixel(
-                                x + dx,
-                                y + dy
-                            ) {
-                                self.vars[0xF] = 1;
-                            }
-                        }
-                    }
+                let mut addr = self.index;
+                for &plane in self.screen.selected_planes.clone().iter() {
+                    let sprite = &self.memory[addr..addr + int.n as usize];
+                    let flag = self.screen.draw_sprite(x, y, sprite, plane);
+                    if flag { self.vars[0xF] = 1; }
+                    addr += int.n as usize;
                 }
             }
             /* EX9E: Skip if pressed */
             (0xE, _, 0x9, 0xE) => {
                 if keys.contains(&vx) {
                     info!("{:04}: {} -> Skipping, key {} is pressed", from, int, vx);
-                    self.pc += 2;
+                    self.skip_instruction();
                 } else {
                     info!("{:04}: {} -> Not skipping, key {} is not pressed", from, int, vx);
                 }
@@ -582,15 +596,12 @@ impl Interpreter {
                     info!("{:04}: {} -> Not skipping, key {} is pressed", from, int, vx);
                 } else {
                     info!("{:04}: {} -> Skipping, key {} is not pressed", from, int, vx);
-                    self.pc += 2;
+                    self.skip_instruction();
                 }
             }
             /* FX07: Set VX to delay timer */
             (0xF, _, 0x0, 0x7) => {
-                info!(
-                    "{}: {} -> Set V{:X} = {} (delay)",
-                    self.pc, int, int.x, self.delay_timer
-                );
+                info!("{:04}: {} -> Set V{:X} = {} (delay)", self.pc, int, int.x, self.delay_timer);
                 self.vars[int.x] = self.delay_timer
             }
             /* FX15: Set delay timer to VX */
@@ -644,18 +655,18 @@ impl Interpreter {
             }
             /* FX55: Store variable registers into memory - Leave index unchanged quirk */
             (0xF, _, 0x5, 0x5) if self.platform.quirks[&Quirk::MemoryLeaveIUnchanged] => {
-                info!("{:04}: {} -> Store V0..{} into memory[{:04X}..{:04X}]", from, int, int.x, self.index, self.index + int.x);
+                info!("{:04}: {} -> Store V0..{:X} into memory[{:04X}..{:04X}]", from, int, int.x, self.index, self.index + int.x);
                 (0..=int.x).for_each(|i| self.memory[self.index + i] = self.vars[i]);
             }
             /* FX55: Store variable registers into memory - Increment index by X quirk */
             (0xF, _, 0x5, 0x5) if self.platform.quirks[&Quirk::MemoryIncrementByX] => {
-                info!("{:04}: {} -> Store V0..{} into memory[{:04X}..{:04X}]", from, int, int.x, self.index, self.index + int.x);
+                info!("{:04}: {} -> Store V0..{:X} into memory[{:04X}..{:04X}]", from, int, int.x, self.index, self.index + int.x);
                 (0..=int.x).for_each(|i| self.memory[self.index + i] = self.vars[i]);
                 self.index += int.x;
             }
             /* FX55: Store variable registers into memory */
             (0xF, _, 0x5, 0x5) => {
-                info!("{:04}: {} -> Store V0..{} into memory[{:04X}..{:04X}]", from, int, int.x, self.index, self.index + int.x);
+                info!("{:04}: {} -> Store V0..{:X} into memory[{:04X}..{:04X}]", from, int, int.x, self.index, self.index + int.x);
                 (0..=int.x).for_each(|i| self.memory[self.index + i] = self.vars[i]);
                 self.index += int.x + 1;
             }
@@ -678,7 +689,7 @@ impl Interpreter {
             }
             /* FX75: Store variables to flag registers */
             (0xF, _, 0x7, 0x5) => {
-                info!("{:04}: {} -> Store V0..{} into F0..{2:X} ", from, int, int.x);
+                info!("{:04}: {} -> Store V0..{:X} into F0..{2:X} ", from, int, int.x);
                 (0..=int.x).for_each(|i| self.flags[i] = self.vars[i]);
                 self.write_flag_registers()
             }
@@ -686,6 +697,18 @@ impl Interpreter {
             (0xF, _, 0x8, 0x5) => {
                 info!("{:04}: {} -> Store F0..{:X} into V0..{2:X}", from, int, int.x);
                 (0..=int.x).for_each(|i| self.vars[i] = self.flags[i])
+            }
+            /*FX01: Select drawing plane */
+            (0xF, _, 0x0, 0x1) => {
+                info!("{:04}: {} -> Select drawing plane {}", from, int, int.x);
+                self.screen.select_planes(int.x as u16);
+            }
+            /* F000: Set index to 16-bit address - double width instruction */
+            (0xF, 0x0, 0x0, 0x0) if self.platform.id == PlatformId::Xochip => {
+                self.pc += 2;
+                let int = self.fetch_instruction();
+                info!("{:04}: {} -> Set index to {}", from, int, int.opcode);
+                self.index = int.opcode as usize;
             }
             /* Unknown instruction */
             _ => panic!("Unknown instruction at {}: {}", self.pc, int),
@@ -769,12 +792,12 @@ impl Interpreter {
                         self.get_rom();
                     }
                     /* Handle keypad keydown event */
-                    Event::KeyDown { keycode: Some(key), .. } => {
-                        self.keypad.handle_keydown(key);
+                    Event::KeyDown { scancode: Some(scancode), .. } => {
+                        self.keypad.handle_keydown(scancode);
                     }
                     /* Handle keypad keyup event */
-                    Event::KeyUp { keycode: Some(key), .. } => {
-                        self.keypad.handle_keyup(key);
+                    Event::KeyUp { scancode: Some(scancode), .. } => {
+                        self.keypad.handle_keyup(scancode);
                     }
                     _ => ()
                 }
@@ -786,6 +809,12 @@ impl Interpreter {
                 self.reset();
                 self.insert_data(PROGRAM_ADDR, &program);
                 self.program_changed.store(false, Ordering::Relaxed);
+            }
+
+            if self.display_interrupt.irq() {
+                if self.screen.redraw() {
+                    info!("XXXX: DISPLAY -> Redraw")
+                }
             }
 
             // Stop executing if no program is loaded or paused, allow debug stepping

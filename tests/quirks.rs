@@ -157,13 +157,14 @@ fn quirks_test_chip8() {
     let mut interpreter = Interpreter::with_program(&args, platform, PROGRAM.to_vec());
     interpreter.memory[0x1FF] = 0x1; // Select Original CHIP-8 quirks test
     while !interpreter.wait_input {
+        interpreter.screen.canvas.present();
         interpreter.cycle();
     }
     // Compare final screen to all tests passed screen
     assert_eq!(
         interpreter
             .screen
-            .buffer
+            .planes[0]
             .iter()
             .map(|&i| i as u8)
             .collect::<Vec<u8>>(),
@@ -178,13 +179,14 @@ fn quirks_test_superchip() {
     let mut interpreter = Interpreter::with_program(&args, platform, PROGRAM.to_vec());
     interpreter.memory[0x1FF] = 0x2; // Select Original SUPER-CHIP quirks test
     while !interpreter.wait_input {
+        interpreter.screen.canvas.present();
         interpreter.cycle();
     }
     // Compare final screen to all tests passed screen
     assert_eq!(
         interpreter
             .screen
-            .buffer
+            .planes[0]
             .iter()
             .map(|&i| i as u8)
             .collect::<Vec<u8>>(),
